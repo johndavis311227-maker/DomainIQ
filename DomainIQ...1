@@ -1,0 +1,912 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Dict, List, Optional
+import requests
+import whois
+import re
+import json
+from datetime import datetime, timedelta
+import asyncio
+import aiohttp
+from dataclasses import dataclass
+import syllables
+import pronouncing
+from textstat import flesch_reading_ease
+import hashlib
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Domain Flipping Assistant", version="1.0.0")
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Data models
+class DomainRequest(BaseModel):
+    domain: str
+    target_niche: Optional[str] = None
+    budget_max: Optional[float] = None
+
+class DomainAnalysis(BaseModel):
+    domain: str
+    overall_score: float
+    recommendation: str
+    analyses: Dict
+    sales_pitch: str
+    estimated_value: Dict
+
+# Configuration - In production, use environment variables
+CONFIG = {
+    "WHOIS_API_KEY": "your_whois_api_key",
+    "MOZ_ACCESS_ID": "your_moz_access_id",
+    "MOZ_SECRET_KEY": "your_moz_secret_key",
+    "AHREFS_API_KEY": "your_ahrefs_api_key",
+    "TRADEMARK_API_KEY": "your_trademark_api_key",
+    "NAMECHEAP_API_KEY": "your_namecheap_api_key",
+    "OPENAI_API_KEY": "your_openai_api_key"
+}
+
+class DomainAnalyzer:
+    def __init__(self):
+        self.session = aiohttp.ClientSession()
+        
+    async def analyze_domain_history(self, domain: str) -> Dict:
+        """Analyze domain history and reputation"""
+        try:
+            # WHOIS lookup
+            domain_info = whois.whois(domain)
+            
+            analysis = {
+                "creation_date": str(domain_info.creation_date) if domain_info.creation_date else None,
+                "expiration_date": str(domain_info.expiration_date) if domain_info.expiration_date else None,
+                "registrar": domain_info.registrar,
+                "age_years": self._calculate_domain_age(domain_info.creation_date),
+                "reputation_flags": []
+            }
+            
+            # Check for suspicious patterns
+            if analysis["age_years"] and analysis["age_years"] < 1:
+                analysis["reputation_flags"].append("Very new domain")
+            
+            # Archive.org check (simplified)
+            archive_data = await self._check_archive_history(domain)
+            analysis.update(archive_data)
+            
+            # Spam/PBN detection heuristics
+            spam_indicators = await self._detect_spam_indicators(domain)
+            analysis["spam_risk"] = spam_indicators["risk_level"]
+            analysis["reputation_flags"].extend(spam_indicators["flags"])
+            
+            return analysis
+            
+        except Exception as e:
+            logger.error(f"Error analyzing domain history for {domain}: {str(e)}")
+            return {"error": str(e), "reputation_flags": ["Analysis failed"]}
+    
+    def _calculate_domain_age(self, creation_date) -> Optional[float]:
+        """Calculate domain age in years"""
+        if not creation_date:
+            return None
+        
+        if isinstance(creation_date, list):
+            creation_date = creation_date[0]
+            
+        age = datetime.now() - creation_date
+        return round(age.days / 365.25, 2)
+    
+    async def _check_archive_history(self, domain: str) -> Dict:
+        """Check Wayback Machine for domain history"""
+        try:
+            url = f"https://archive.org/wayback/available?url={domain}"
+            async with self.session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    archived_snapshots = data.get("archived_snapshots", {})
+                    closest = archived_snapshots.get("closest", {})
+                    
+                    return {
+                        "has_archive_history": bool(closest),
+                        "first_archived": closest.get("timestamp", ""),
+                        "archive_status": closest.get("status", "")
+                    }
+        except Exception as e:
+            logger.error(f"Archive check failed for {domain}: {str(e)}")
+            
+        return {"has_archive_history": False, "archive_status": "unknown"}
+    
+    async def _detect_spam_indicators(self, domain: str) -> Dict:
+        """Detect potential spam or PBN indicators"""
+        flags = []
+        risk_level = "low"
+        
+        # Heuristic checks
+        if len(re.findall(r'\d', domain)) > len(domain) * 0.3:
+            flags.append("High number ratio")
+            risk_level = "medium"
+        
+        if '-' in domain and domain.count('-') > 2:
+            flags.append("Multiple hyphens")
+            risk_level = "medium"
+        
+        # Check against known spam TLDs
+        spam_tlds = ['.tk', '.ml', '.ga', '.cf', '.info']
+        if any(domain.endswith(tld) for tld in spam_tlds):
+            flags.append("Potentially spam-prone TLD")
+            risk_level = "medium"
+        
+        return {"risk_level": risk_level, "flags": flags}
+    
+    async def analyze_trademark_conflicts(self, domain: str) -> Dict:
+        """Check for trademark conflicts"""
+        try:
+            # Extract domain name without TLD
+            domain_name = domain.split('.')[0]
+            
+            # Mock trademark search - in production, integrate with USPTO/EUIPO APIs
+            conflicts = await self._search_trademarks(domain_name)
+            
+            return {
+                "has_conflicts": len(conflicts) > 0,
+                "verdict": "YES" if conflicts else "NO",
+                "conflicts": conflicts,
+                "risk_assessment": "high" if conflicts else "low"
+            }
+            
+        except Exception as e:
+            logger.error(f"Trademark analysis failed for {domain}: {str(e)}")
+            return {"has_conflicts": False, "verdict": "NO", "error": str(e)}
+    
+    async def _search_trademarks(self, term: str) -> List[Dict]:
+        """Search trademark databases"""
+        # Mock implementation - replace with actual API calls
+        mock_trademarks = [
+            {"term": "google", "class": "35", "status": "active"},
+            {"term": "amazon", "class": "35", "status": "active"},
+            {"term": "microsoft", "class": "9", "status": "active"}
+        ]
+        
+        conflicts = []
+        for tm in mock_trademarks:
+            if tm["term"].lower() in term.lower():
+                conflicts.append({
+                    "trademark": tm["term"],
+                    "class": tm["class"],
+                    "similarity_score": 0.8,
+                    "risk": "high"
+                })
+        
+        return conflicts
+    
+    async def analyze_seo_profile(self, domain: str) -> Dict:
+        """Analyze SEO metrics and backlink profile"""
+        try:
+            # Mock Moz/Ahrefs integration
+            seo_data = {
+                "domain_authority": await self._get_domain_authority(domain),
+                "page_authority": await self._get_page_authority(domain),
+                "spam_score": await self._get_spam_score(domain),
+                "backlinks": await self._get_backlink_data(domain),
+                "organic_keywords": await self._get_organic_keywords(domain)
+            }
+            
+            # Calculate overall SEO score
+            da_score = seo_data["domain_authority"] / 10
+            spam_penalty = max(0, (100 - seo_data["spam_score"]) / 10)
+            backlink_score = min(10, seo_data["backlinks"]["total"] / 100)
+            
+            seo_data["overall_seo_score"] = round((da_score + spam_penalty + backlink_score) / 3, 1)
+            
+            return seo_data
+            
+        except Exception as e:
+            logger.error(f"SEO analysis failed for {domain}: {str(e)}")
+            return {"error": str(e), "overall_seo_score": 0}
+    
+    async def _get_domain_authority(self, domain: str) -> int:
+        """Get domain authority from Moz"""
+        # Mock implementation
+        return hash(domain) % 100
+    
+    async def _get_page_authority(self, domain: str) -> int:
+        """Get page authority from Moz"""
+        return hash(domain + "pa") % 100
+    
+    async def _get_spam_score(self, domain: str) -> int:
+        """Get spam score"""
+        return hash(domain + "spam") % 30  # 0-30 range
+    
+    async def _get_backlink_data(self, domain: str) -> Dict:
+        """Get backlink profile data"""
+        total_backlinks = hash(domain) % 10000
+        return {
+            "total": total_backlinks,
+            "referring_domains": total_backlinks // 10,
+            "dofollow": int(total_backlinks * 0.7),
+            "quality_score": hash(domain + "quality") % 10
+        }
+    
+    async def _get_organic_keywords(self, domain: str) -> Dict:
+        """Get organic keyword data"""
+        return {
+            "total_keywords": hash(domain) % 1000,
+            "top_3_keywords": hash(domain) % 50,
+            "estimated_traffic": hash(domain) % 50000
+        }
+    
+    def analyze_brandability(self, domain: str) -> Dict:
+        """Analyze brandability and memorability"""
+        domain_name = domain.split('.')[0]
+        
+        # Phonetic analysis
+        syllable_count = syllables.estimate(domain_name)
+        
+        # Memorability factors
+        length_score = self._score_length(len(domain_name))
+        pronunciation_score = self._score_pronunciation(domain_name)
+        uniqueness_score = self._score_uniqueness(domain_name)
+        emotional_impact = self._analyze_emotional_impact(domain_name)
+        
+        overall_score = round((length_score + pronunciation_score + uniqueness_score + emotional_impact) / 4, 1)
+        
+        return {
+            "overall_brandability": overall_score,
+            "syllable_count": syllable_count,
+            "length_score": length_score,
+            "pronunciation_score": pronunciation_score,
+            "uniqueness_score": uniqueness_score,
+            "emotional_impact": emotional_impact,
+            "memorable_factors": self._get_memorable_factors(domain_name)
+        }
+    
+    def _score_length(self, length: int) -> float:
+        """Score based on domain length"""
+        if length <= 6:
+            return 10.0
+        elif length <= 10:
+            return 8.0
+        elif length <= 15:
+            return 6.0
+        else:
+            return 3.0
+    
+    def _score_pronunciation(self, domain_name: str) -> float:
+        """Score pronunciation difficulty"""
+        # Simple heuristics
+        vowels = sum(1 for char in domain_name.lower() if char in 'aeiou')
+        consonant_clusters = len(re.findall(r'[bcdfghjklmnpqrstvwxyz]{3,}', domain_name.lower()))
+        
+        if consonant_clusters > 2:
+            return 4.0
+        elif vowels / len(domain_name) > 0.4:
+            return 9.0
+        else:
+            return 7.0
+    
+    def _score_uniqueness(self, domain_name: str) -> float:
+        """Score uniqueness"""
+        # Check for dictionary words
+        common_words = ['the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'had', 'her', 'was', 'one', 'our', 'out', 'day', 'get', 'has', 'him', 'his', 'how', 'its', 'may', 'new', 'now', 'old', 'see', 'two', 'who', 'boy', 'did', 'man', 'run', 'way', 'she', 'may', 'say', 'use', 'her', 'each', 'which', 'their', 'said', 'make', 'like', 'into', 'time', 'very', 'when', 'come', 'here', 'just', 'know', 'long', 'make', 'many', 'over', 'such', 'take', 'than', 'them', 'well', 'work', 'first', 'been', 'call', 'who', 'its', 'now', 'find', 'long', 'down', 'day', 'did', 'get', 'has', 'him', 'his', 'how', 'man', 'new', 'now', 'old', 'see', 'two', 'way', 'who', 'boy', 'run', 'she', 'use', 'her']
+        
+        if domain_name.lower() in common_words:
+            return 5.0
+        elif any(word in domain_name.lower() for word in common_words):
+            return 7.0
+        else:
+            return 9.0
+    
+    def _analyze_emotional_impact(self, domain_name: str) -> float:
+        """Analyze emotional impact of domain name"""
+        positive_words = ['happy', 'joy', 'love', 'success', 'win', 'bright', 'smart', 'fast', 'pro', 'best', 'top', 'great', 'super', 'ultra', 'mega', 'prime']
+        negative_words = ['sad', 'fail', 'slow', 'bad', 'worst', 'ugly', 'hate', 'anger', 'fear', 'dark']
+        
+        positive_score = sum(2 for word in positive_words if word in domain_name.lower())
+        negative_score = sum(1 for word in negative_words if word in domain_name.lower())
+        
+        base_score = 5.0
+        return max(1.0, min(10.0, base_score + positive_score - negative_score))
+    
+    def _get_memorable_factors(self, domain_name: str) -> List[str]:
+        """Get factors that make domain memorable"""
+        factors = []
+        
+        if len(domain_name) <= 6:
+            factors.append("Short length")
+        
+        if re.match(r'^[a-zA-Z]+$', domain_name):
+            factors.append("Letters only")
+        
+        if domain_name.lower() == domain_name.lower()[::-1]:
+            factors.append("Palindrome")
+        
+        if len(set(domain_name.lower())) / len(domain_name) > 0.7:
+            factors.append("Diverse characters")
+        
+        return factors
+    
+    def analyze_tld_appropriateness(self, domain: str, niche: str = None) -> Dict:
+        """Analyze TLD appropriateness for niche"""
+        tld = '.' + domain.split('.')[-1]
+        
+        tld_rankings = {
+            '.com': {'general': 10, 'tech': 9, 'business': 10, 'blog': 8},
+            '.io': {'general': 7, 'tech': 10, 'business': 7, 'blog': 6},
+            '.net': {'general': 8, 'tech': 8, 'business': 7, 'blog': 7},
+            '.org': {'general': 7, 'tech': 6, 'business': 5, 'blog': 8},
+            '.co': {'general': 8, 'tech': 8, 'business': 9, 'blog': 7},
+            '.ai': {'general': 6, 'tech': 10, 'business': 8, 'blog': 6},
+            '.app': {'general': 7, 'tech': 9, 'business': 7, 'blog': 5}
+        }
+        
+        default_niche = 'general' if not niche else niche.lower()
+        score = tld_rankings.get(tld, {'general': 5}).get(default_niche, 5)
+        
+        return {
+            'tld': tld,
+            'appropriateness_score': score,
+            'niche_fit': self._get_tld_niche_analysis(tld, default_niche),
+            'trust_factor': self._get_tld_trust_factor(tld)
+        }
+    
+    def _get_tld_niche_analysis(self, tld: str, niche: str) -> str:
+        """Get TLD niche analysis"""
+        analyses = {
+            '.com': 'Universal appeal, highest trust',
+            '.io': 'Perfect for tech startups and SaaS',
+            '.ai': 'Ideal for AI/ML companies',
+            '.org': 'Best for non-profits and organizations',
+            '.co': 'Modern alternative to .com',
+            '.net': 'Good for network/tech services'
+        }
+        return analyses.get(tld, 'Standard domain extension')
+    
+    def _get_tld_trust_factor(self, tld: str) -> float:
+        """Get trust factor for TLD"""
+        trust_scores = {
+            '.com': 10.0, '.org': 9.0, '.net': 8.5, '.edu': 9.5,
+            '.co': 8.0, '.io': 7.5, '.ai': 7.0, '.app': 7.0
+        }
+        return trust_scores.get(tld, 5.0)
+    
+    def analyze_length_clarity(self, domain: str) -> Dict:
+        """Analyze domain length and clarity"""
+        domain_name = domain.split('.')[0]
+        
+        return {
+            'character_count': len(domain_name),
+            'word_count': len(re.findall(r'[A-Z][a-z]*|[a-z]+', domain_name)),
+            'has_hyphens': '-' in domain_name,
+            'has_numbers': bool(re.search(r'\d', domain_name)),
+            'readability_score': self._calculate_readability(domain_name),
+            'clarity_rating': self._rate_clarity(domain_name)
+        }
+    
+    def _calculate_readability(self, domain_name: str) -> float:
+        """Calculate readability score"""
+        # Simple readability based on length and complexity
+        base_score = 100
+        
+        # Penalize length
+        if len(domain_name) > 15:
+            base_score -= 30
+        elif len(domain_name) > 10:
+            base_score -= 15
+        
+        # Penalize numbers and hyphens
+        if '-' in domain_name:
+            base_score -= 10
+        if re.search(r'\d', domain_name):
+            base_score -= 15
+        
+        return max(0, base_score)
+    
+    def _rate_clarity(self, domain_name: str) -> int:
+        """Rate clarity from 1-10"""
+        score = 10
+        
+        if len(domain_name) > 15:
+            score -= 3
+        if '-' in domain_name:
+            score -= 1
+        if re.search(r'\d', domain_name):
+            score -= 2
+        if len(re.findall(r'[bcdfghjklmnpqrstvwxyz]{3,}', domain_name.lower())) > 0:
+            score -= 2
+        
+        return max(1, score)
+    
+    async def check_social_media_availability(self, domain: str) -> Dict:
+        """Check social media handle availability"""
+        domain_name = domain.split('.')[0]
+        platforms = ['twitter', 'instagram', 'facebook', 'tiktok', 'youtube', 'linkedin']
+        
+        availability = {}
+        for platform in platforms:
+            availability[platform] = await self._check_handle_availability(domain_name, platform)
+        
+        available_count = sum(1 for avail in availability.values() if avail['available'])
+        
+        return {
+            'handles': availability,
+            'availability_score': round((available_count / len(platforms)) * 10, 1),
+            'summary': f"{available_count}/{len(platforms)} handles available"
+        }
+    
+    async def _check_handle_availability(self, handle: str, platform: str) -> Dict:
+        """Check if handle is available on specific platform"""
+        # Mock implementation - in production, use actual API calls
+        import random
+        available = random.choice([True, False])
+        
+        return {
+            'available': available,
+            'url': f"https://{platform}.com/{handle}",
+            'last_checked': datetime.now().isoformat()
+        }
+    
+    async def estimate_pricing(self, domain: str) -> Dict:
+        """Estimate domain pricing and renewal costs"""
+        tld = '.' + domain.split('.')[-1]
+        
+        # Mock pricing data - integrate with registrar APIs
+        pricing_data = {
+            '.com': {'registration': 12.99, 'renewal': 14.99, 'transfer': 12.99},
+            '.io': {'registration': 39.99, 'renewal': 39.99, 'transfer': 39.99},
+            '.ai': {'registration': 99.99, 'renewal': 99.99, 'transfer': 99.99},
+            '.org': {'registration': 14.99, 'renewal': 16.99, 'transfer': 14.99},
+            '.net': {'registration': 13.99, 'renewal': 15.99, 'transfer': 13.99}
+        }
+        
+        prices = pricing_data.get(tld, {'registration': 15.99, 'renewal': 17.99, 'transfer': 15.99})
+        
+        # Check if domain is premium
+        is_premium = len(domain.split('.')[0]) <= 4 or domain.split('.')[0] in ['ai', 'io', 'tech', 'app']
+        
+        if is_premium:
+            prices = {k: v * 3 for k, v in prices.items()}
+        
+        return {
+            'current_price': prices['registration'],
+            'renewal_cost': prices['renewal'],
+            'transfer_cost': prices['transfer'],
+            'is_premium': is_premium,
+            'currency': 'USD',
+            'estimated_total_year_1': prices['registration'],
+            'estimated_total_year_5': prices['registration'] + (prices['renewal'] * 4)
+        }
+    
+    def check_registration_restrictions(self, domain: str) -> Dict:
+        """Check for registration restrictions"""
+        tld = '.' + domain.split('.')[-1]
+        
+        restrictions = {
+            '.edu': {'type': 'institutional', 'requirement': 'Educational institution'},
+            '.gov': {'type': 'governmental', 'requirement': 'Government entity'},
+            '.mil': {'type': 'military', 'requirement': 'Military organization'},
+            '.us': {'type': 'geographic', 'requirement': 'US presence required'},
+            '.uk': {'type': 'geographic', 'requirement': 'UK presence required'},
+            '.de': {'type': 'geographic', 'requirement': 'German address required'},
+        }
+        
+        restriction = restrictions.get(tld)
+        
+        return {
+            'has_restrictions': restriction is not None,
+            'restriction_type': restriction['type'] if restriction else None,
+            'requirements': restriction['requirement'] if restriction else None,
+            'registration_difficulty': 'high' if restriction else 'low'
+        }
+    
+    def assess_scalability(self, domain: str, niche: str = None) -> Dict:
+        """Assess future scalability potential"""
+        domain_name = domain.split('.')[0].lower()
+        
+        # Analyze domain characteristics for scalability
+        versatility_score = self._calculate_versatility(domain_name, niche)
+        expansion_potential = self._analyze_expansion_potential(domain_name, niche)
+        market_adaptability = self._assess_market_adaptability(domain_name)
+        
+        overall_scalability = round((versatility_score + expansion_potential + market_adaptability) / 3, 1)
+        
+        return {
+            'scalability_score': overall_scalability,
+            'versatility': versatility_score,
+            'expansion_potential': expansion_potential,
+            'market_adaptability': market_adaptability,
+            'scalability_factors': self._get_scalability_factors(domain_name, niche)
+        }
+    
+    def _calculate_versatility(self, domain_name: str, niche: str) -> float:
+        """Calculate domain versatility"""
+        # Generic words are more versatile
+        generic_terms = ['app', 'tech', 'pro', 'hub', 'lab', 'studio', 'group', 'solutions', 'systems']
+        
+        if any(term in domain_name for term in generic_terms):
+            return 9.0
+        elif niche and niche.lower() in domain_name:
+            return 6.0
+        else:
+            return 8.0
+    
+    def _analyze_expansion_potential(self, domain_name: str, niche: str) -> float:
+        """Analyze expansion potential"""
+        if len(domain_name) <= 8 and not any(char.isdigit() for char in domain_name):
+            return 9.0
+        elif '-' in domain_name:
+            return 5.0
+        else:
+            return 7.0
+    
+    def _assess_market_adaptability(self, domain_name: str) -> float:
+        """Assess market adaptability"""
+        trendy_terms = ['ai', 'tech', 'digital', 'smart', 'auto', 'pro', 'max', 'plus']
+        
+        if any(term in domain_name for term in trendy_terms):
+            return 8.0
+        else:
+            return 7.0
+    
+    def _get_scalability_factors(self, domain_name: str, niche: str) -> List[str]:
+        """Get factors affecting scalability"""
+        factors = []
+        
+        if len(domain_name) <= 8:
+            factors.append("Short and memorable")
+        
+        if not any(char.isdigit() for char in domain_name):
+            factors.append("No limiting numbers")
+        
+        if '-' not in domain_name:
+            factors.append("No hyphens for flexibility")
+        
+        generic_terms = ['app', 'tech', 'pro', 'hub', 'lab']
+        if any(term in domain_name for term in generic_terms):
+            factors.append("Contains generic terms")
+        
+        return factors
+    
+    def generate_sales_pitch(self, domain: str, analysis_results: Dict, target_audience: str = "general") -> str:
+        """Generate compelling sales pitch"""
+        domain_name = domain.split('.')[0]
+        
+        # Extract key selling points
+        brandability_score = analysis_results.get('brandability', {}).get('overall_brandability', 5)
+        seo_score = analysis_results.get('seo_profile', {}).get('overall_seo_score', 5)
+        age = analysis_results.get('domain_history', {}).get('age_years', 0)
+        
+        # Customize pitch based on target audience
+        pitches = {
+            "startup": f"🚀 **{domain.upper()}** - The Perfect Startup Domain!\n\n"
+                      f"✨ Brandability Score: {brandability_score}/10 - Highly memorable and professional\n"
+                      f"📈 SEO Strength: {seo_score}/10 - Built-in search advantage\n"
+                      f"⚡ Short, punchy, and perfect for rapid scaling\n"
+                      f"💡 This domain screams innovation and tech leadership\n\n"
+                      f"Don't let your competition grab this gem. Perfect for SaaS, fintech, or any disruptive startup!",
+            
+            "ecommerce": f"🛒 **{domain.upper()}** - E-commerce Gold!\n\n"
+                        f"💎 Premium brandability ({brandability_score}/10) = Customer trust & recall\n"
+                        f"🎯 SEO-ready foundation ({seo_score}/10) = Free organic traffic\n"
+                        f"📱 Mobile-friendly and social-ready\n"
+                        f"🌟 This domain converts browsers into buyers\n\n"
+                        f"Perfect for online stores, marketplaces, or service businesses. Your customers will remember this!",
+            
+            "blogger": f"✍️ **{domain.upper()}** - Blogger's Dream Domain!\n\n"
+                      f"🎨 Highly brandable ({brandability_score}/10) - Stands out in crowded niches\n"
+                      f"📊 Strong SEO foundation ({seo_score}/10) - Rank faster, attract more readers\n"
+                      f"🌐 Social media handle availability - Build your complete brand\n"
+                      f"💬 Easy to remember, easy to share\n\n"
+                      f"Turn your passion into profit with a domain that your audience will love and remember!",
+            
+            "general": f"🏆 **{domain.upper()}** - Premium Digital Real Estate!\n\n"
+                      f"⭐ Brandability: {brandability_score}/10 - Memorable and professional\n"
+                      f"🔍 SEO Power: {seo_score}/10 - Search engine advantage\n"
+                      f"📅 Domain Age: {age} years - Established presence\n"
+                      f"💰 Investment-grade domain with strong resale potential\n\n"
+                      f"Whether you're building a business, blog, or brand, this domain gives you the edge you need!"
+        }
+        
+        return pitches.get(target_audience, pitches["general"])
+    
+    def rate_resale_value(self, domain: str, analysis_results: Dict) -> Dict:
+        """Rate domain for resale potential and SEO value"""
+        
+        # Extract metrics
+        brandability = analysis_results.get('brandability', {}).get('overall_brandability', 5)
+        seo_score = analysis_results.get('seo_profile', {}).get('overall_seo_score', 5)
+        age = analysis_results.get('domain_history', {}).get('age_years', 0)
+        length = len(domain.split('.')[0])
+        tld_score = analysis_results.get('tld_analysis', {}).get('appropriateness_score', 5)
+        
+        # Calculate resale score
+        length_score = 10 if length <= 6 else (8 if length <= 10 else 5)
+        age_score = min(10, age * 2) if age else 3
+        
+        resale_score = round((brandability * 0.3 + seo_score * 0.25 + length_score * 0.2 + age_score * 0.15 + tld_score * 0.1), 1)
+        
+        # Calculate SEO value rating
+        seo_value_score = round((seo_score * 0.4 + age_score * 0.3 + tld_score * 0.2 + (10 - length/2) * 0.1), 1)
+        
+        return {
+            'resale_rating': min(10, resale_score),
+            'seo_value_rating': min(10, seo_value_score),
+            'market_appeal': self._assess_market_appeal(domain, analysis_results),
+            'investment_grade': resale_score >= 7.0,
+            'value_factors': self._get_value_factors(domain, analysis_results)
+        }
+    
+    def _assess_market_appeal(self, domain: str, analysis_results: Dict) -> str:
+        """Assess market appeal level"""
+        resale_score = analysis_results.get('resale_rating', 5)
+        
+        if resale_score >= 8.5:
+            return "Premium - High demand expected"
+        elif resale_score >= 7.0:
+            return "Strong - Good market interest"
+        elif resale_score >= 5.5:
+            return "Moderate - Niche appeal"
+        else:
+            return "Limited - Specialized market only"
+    
+    def _get_value_factors(self, domain: str, analysis_results: Dict) -> List[str]:
+        """Get factors that add value to domain"""
+        factors = []
+        
+        domain_name = domain.split('.')[0]
+        brandability = analysis_results.get('brandability', {}).get('overall_brandability', 5)
+        
+        if len(domain_name) <= 6:
+            factors.append("Premium short length")
+        
+        if brandability >= 8:
+            factors.append("Highly brandable")
+        
+        if '.com' in domain:
+            factors.append(".com premium TLD")
+        
+        age = analysis_results.get('domain_history', {}).get('age_years', 0)
+        if age and age >= 5:
+            factors.append("Aged domain authority")
+        
+        if not any(char.isdigit() for char in domain_name):
+            factors.append("No confusing numbers")
+        
+        return factors
+
+    async def analyze_domain_complete(self, domain: str, niche: str = None) -> Dict:
+        """Complete domain analysis"""
+        try:
+            # Run all analyses
+            analyses = {}
+            
+            analyses['domain_history'] = await self.analyze_domain_history(domain)
+            analyses['trademark_conflicts'] = await self.analyze_trademark_conflicts(domain)
+            analyses['seo_profile'] = await self.analyze_seo_profile(domain)
+            analyses['brandability'] = self.analyze_brandability(domain)
+            analyses['tld_analysis'] = self.analyze_tld_appropriateness(domain, niche)
+            analyses['length_clarity'] = self.analyze_length_clarity(domain)
+            analyses['social_media'] = await self.check_social_media_availability(domain)
+            analyses['pricing'] = await self.estimate_pricing(domain)
+            analyses['restrictions'] = self.check_registration_restrictions(domain)
+            analyses['scalability'] = self.assess_scalability(domain, niche)
+            
+            # Calculate overall score
+            overall_score = self._calculate_overall_score(analyses)
+            
+            # Add resale rating
+            analyses['resale_value'] = self.rate_resale_value(domain, analyses)
+            
+            # Generate sales pitch
+            sales_pitch = self.generate_sales_pitch(domain, analyses, "general")
+            
+            # Generate recommendation
+            recommendation = self._generate_recommendation(domain, overall_score, analyses)
+            
+            # Estimate domain value
+            estimated_value = self._estimate_domain_value(domain, analyses)
+            
+            return {
+                'domain': domain,
+                'overall_score': overall_score,
+                'recommendation': recommendation,
+                'analyses': analyses,
+                'sales_pitch': sales_pitch,
+                'estimated_value': estimated_value,
+                'analysis_timestamp': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"Complete analysis failed for {domain}: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+    
+    def _calculate_overall_score(self, analyses: Dict) -> float:
+        """Calculate overall domain score"""
+        weights = {
+            'brandability': 0.25,
+            'seo_profile': 0.20,
+            'tld_analysis': 0.15,
+            'length_clarity': 0.10,
+            'social_media': 0.10,
+            'scalability': 0.10,
+            'domain_history': 0.10
+        }
+        
+        score = 0
+        for key, weight in weights.items():
+            analysis = analyses.get(key, {})
+            
+            if key == 'brandability':
+                score += analysis.get('overall_brandability', 5) * weight
+            elif key == 'seo_profile':
+                score += analysis.get('overall_seo_score', 5) * weight
+            elif key == 'tld_analysis':
+                score += analysis.get('appropriateness_score', 5) * weight
+            elif key == 'length_clarity':
+                score += analysis.get('clarity_rating', 5) * weight
+            elif key == 'social_media':
+                score += analysis.get('availability_score', 5) * weight
+            elif key == 'scalability':
+                score += analysis.get('scalability_score', 5) * weight
+            elif key == 'domain_history':
+                age = analysis.get('age_years', 0)
+                history_score = min(10, age * 2) if age else 5
+                score += history_score * weight
+        
+        return round(score, 1)
+    
+    def _generate_recommendation(self, domain: str, overall_score: float, analyses: Dict) -> str:
+        """Generate investment recommendation"""
+        trademark_issues = analyses.get('trademark_conflicts', {}).get('has_conflicts', False)
+        
+        if trademark_issues:
+            return "❌ AVOID - Trademark conflicts detected"
+        elif overall_score >= 8.5:
+            return "🟢 STRONG BUY - Excellent investment opportunity"
+        elif overall_score >= 7.0:
+            return "🟡 BUY - Good potential with solid fundamentals"
+        elif overall_score >= 5.5:
+            return "🟠 CONSIDER - Moderate potential, niche appeal"
+        else:
+            return "🔴 PASS - Limited investment appeal"
+    
+    def _estimate_domain_value(self, domain: str, analyses: Dict) -> Dict:
+        """Estimate domain monetary value"""
+        base_value = 100  # Base value in USD
+        
+        # Factors that increase value
+        brandability = analyses.get('brandability', {}).get('overall_brandability', 5)
+        seo_score = analyses.get('seo_profile', {}).get('overall_seo_score', 5)
+        age = analyses.get('domain_history', {}).get('age_years', 0)
+        length = len(domain.split('.')[0])
+        
+        # Calculate multipliers
+        brandability_multiplier = 1 + (brandability - 5) * 0.2
+        seo_multiplier = 1 + (seo_score - 5) * 0.15
+        age_multiplier = 1 + (age * 0.1) if age else 1
+        length_multiplier = 2.0 if length <= 4 else (1.5 if length <= 6 else 1.0)
+        
+        # TLD premium
+        tld = '.' + domain.split('.')[-1]
+        tld_multiplier = {'com': 2.0, '.io': 1.5, '.ai': 1.8, '.co': 1.3}.get(tld, 1.0)
+        
+        estimated_value = base_value * brandability_multiplier * seo_multiplier * age_multiplier * length_multiplier * tld_multiplier
+        
+        return {
+            'estimated_min': round(estimated_value * 0.7),
+            'estimated_max': round(estimated_value * 1.5),
+            'estimated_average': round(estimated_value),
+            'currency': 'USD',
+            'confidence_level': 'moderate',
+            'valuation_factors': {
+                'brandability_impact': f"{(brandability_multiplier - 1) * 100:.0f}%",
+                'seo_impact': f"{(seo_multiplier - 1) * 100:.0f}%",
+                'age_impact': f"{(age_multiplier - 1) * 100:.0f}%",
+                'length_impact': f"{(length_multiplier - 1) * 100:.0f}%",
+                'tld_impact': f"{(tld_multiplier - 1) * 100:.0f}%"
+            }
+        }
+
+# Initialize analyzer
+analyzer = DomainAnalyzer()
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize application"""
+    logger.info("Domain Flipping Assistant API started")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    await analyzer.session.close()
+
+@app.get("/")
+async def root():
+    """API root endpoint"""
+    return {
+        "message": "Domain Flipping Assistant API",
+        "version": "1.0.0",
+        "documentation": "/docs"
+    }
+
+@app.post("/analyze", response_model=DomainAnalysis)
+async def analyze_domain(request: DomainRequest):
+    """Analyze a domain comprehensively"""
+    try:
+        # Validate domain format
+        if not request.domain or '.' not in request.domain:
+            raise HTTPException(status_code=400, detail="Invalid domain format")
+        
+        # Perform complete analysis
+        result = await analyzer.analyze_domain_complete(
+            request.domain, 
+            request.target_niche
+        )
+        
+        return DomainAnalysis(**result)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Analysis error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/analyze/{domain}")
+async def analyze_domain_get(domain: str, niche: str = None):
+    """Analyze domain via GET request"""
+    request = DomainRequest(domain=domain, target_niche=niche)
+    return await analyze_domain(request)
+
+@app.post("/batch-analyze")
+async def batch_analyze_domains(domains: List[str], niche: str = None):
+    """Analyze multiple domains"""
+    if len(domains) > 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 domains per batch")
+    
+    results = []
+    for domain in domains:
+        try:
+            result = await analyzer.analyze_domain_complete(domain, niche)
+            results.append(result)
+        except Exception as e:
+            results.append({
+                "domain": domain,
+                "error": str(e),
+                "overall_score": 0
+            })
+    
+    return {"results": results}
+
+@app.get("/quick-check/{domain}")
+async def quick_domain_check(domain: str):
+    """Quick domain availability and basic info"""
+    try:
+        basic_info = {
+            "domain": domain,
+            "length": len(domain.split('.')[0]),
+            "tld": '.' + domain.split('.')[-1],
+            "has_hyphens": '-' in domain,
+            "has_numbers": any(c.isdigit() for c in domain),
+            "estimated_brandability": analyzer.analyze_brandability(domain)['overall_brandability']
+        }
+        
+        return basic_info
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
